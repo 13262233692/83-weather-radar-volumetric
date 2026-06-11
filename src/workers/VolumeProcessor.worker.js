@@ -8,6 +8,32 @@ self.onmessage = async function(e) {
     } catch (err) {
       self.postMessage({ type: 'processError', error: err.message });
     }
+  } else if (type === 'extractHailCore') {
+    try {
+      const mesh = await extractHailCoreMT(payload);
+      const transferBuffers = [mesh.vertices.buffer, mesh.normals.buffer, mesh.colors.buffer];
+      if (mesh.indices) transferBuffers.push(mesh.indices.buffer);
+      self.postMessage({ type: 'hailCoreComplete', payload: mesh }, transferBuffers);
+    } catch (err) {
+      self.postMessage({ type: 'hailCoreError', error: err.message });
+    }
+  } else if (type === 'processAndExtract') {
+    try {
+      const result = await processPolarToCartesian(payload);
+      self.postMessage({ type: 'processComplete', payload: result }, [result.data.buffer]);
+      const mesh = await extractHailCoreMT({
+        volumeData: result.data,
+        size: result.size,
+        range: result.range,
+        threshold: payload.hailThreshold || 65,
+        zdrThreshold: payload.zdrThreshold || 0.5
+      });
+      const transferBuffers = [mesh.vertices.buffer, mesh.normals.buffer, mesh.colors.buffer];
+      if (mesh.indices) transferBuffers.push(mesh.indices.buffer);
+      self.postMessage({ type: 'hailCoreComplete', payload: mesh }, transferBuffers);
+    } catch (err) {
+      self.postMessage({ type: 'hailCoreError', error: err.message });
+    }
   } else if (type === 'processNetCDF') {
     try {
       const parsed = await parseNetCDF(payload.buffer);
@@ -389,5 +415,240 @@ async function processPolarToCartesian(opts) {
     }
 
     setTimeout(runBatches, 0);
+  });
+}
+
+const MT_CASE_TABLE = [
+  [],
+  [[0, 3, 2]],
+  [[0, 1, 4]],
+  [[2, 3, 4], [2, 4, 1]],
+  [[1, 2, 5]],
+  [[0, 3, 5], [0, 5, 1]],
+  [[0, 2, 5], [0, 5, 4]],
+  [[3, 4, 5]],
+  [[3, 5, 4]],
+  [[0, 4, 5], [0, 5, 2]],
+  [[0, 1, 5], [0, 5, 3]],
+  [[1, 5, 2]],
+  [[2, 4, 3], [2, 1, 4]],
+  [[0, 4, 1]],
+  [[0, 2, 3]],
+  []
+];
+
+const TETRA_INDICES_6 = [
+  [0, 1, 2, 6],
+  [0, 2, 3, 6],
+  [0, 3, 7, 6],
+  [0, 7, 4, 6],
+  [0, 4, 5, 6],
+  [0, 5, 1, 6]
+];
+
+const TETRA_EDGES = [
+  [0, 1],
+  [1, 2],
+  [2, 0],
+  [0, 3],
+  [1, 3],
+  [2, 3]
+];
+
+function interpolatePos(p0, p1, v0, v1, iso) {
+  if (Math.abs(v1 - v0) < 1e-6) return [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5, (p0[2] + p1[2]) * 0.5];
+  const t = (iso - v0) / (v1 - v0);
+  return [
+    p0[0] + t * (p1[0] - p0[0]),
+    p0[1] + t * (p1[1] - p0[1]),
+    p0[2] + t * (p1[2] - p0[2])
+  ];
+}
+
+async function extractHailCoreMT(opts) {
+  return new Promise((resolve, reject) => {
+    const {
+      volumeData,
+      size,
+      range,
+      threshold = 65,
+      zdrThreshold = 0.5
+    } = opts;
+
+    const Nx = size.x;
+    const Ny = size.y;
+    const Nz = size.z;
+
+    self.postMessage({ type: 'hailCoreProgress', payload: { percent: 5, message: `🧊 Marching Tetrahedra 冰雹核心提取 (${Nx}×${Ny}×${Nz})...` } });
+
+    const isoNorm = (threshold - range.min) / (range.max - range.min);
+    const isoVal = isoNorm * 255;
+
+    const verticesArr = [];
+    const normalsArr = [];
+    const colorsArr = [];
+    const indicesArr = [];
+    let vertexCount = 0;
+
+    const batchSize = Math.max(1, Math.floor(Nz / 15));
+    let z = 0;
+
+    function getVoxel(x, y, z) {
+      if (x < 0 || y < 0 || z < 0 || x >= Nx || y >= Ny || z >= Nz) return 0;
+      return volumeData[z * Nx * Ny + y * Nx + x];
+    }
+
+    function computeNormal(x, y, z) {
+      const eps = 1;
+      const dx = (getVoxel(x + eps, y, z) - getVoxel(x - eps, y, z)) / (2 * eps);
+      const dy = (getVoxel(x, y + eps, z) - getVoxel(x, y - eps, z)) / (2 * eps);
+      const dz = (getVoxel(x, y, z + eps) - getVoxel(x, y, z - eps)) / (2 * eps);
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (len < 1e-6) return [0, 0, 1];
+      return [-dx / len, -dy / len, -dz / len];
+    }
+
+    function processZSlice(startZ, endZ) {
+      for (let zi = startZ; zi < endZ; zi++) {
+        for (let yi = 0; yi < Ny - 1; yi++) {
+          for (let xi = 0; xi < Nx - 1; xi++) {
+            const idx000 = zi * Nx * Ny + yi * Nx + xi;
+            const idx100 = idx000 + 1;
+            const idx010 = idx000 + Nx;
+            const idx110 = idx000 + Nx + 1;
+            const idx001 = idx000 + Nx * Ny;
+            const idx101 = idx000 + Nx * Ny + 1;
+            const idx011 = idx000 + Nx * Ny + Nx;
+            const idx111 = idx000 + Nx * Ny + Nx + 1;
+
+            const v0 = volumeData[idx000];
+            const v1 = volumeData[idx100];
+            const v2 = volumeData[idx110];
+            const v3 = volumeData[idx010];
+            const v4 = volumeData[idx001];
+            const v5 = volumeData[idx101];
+            const v6 = volumeData[idx111];
+            const v7 = volumeData[idx011];
+
+            let maxVal = v0;
+            maxVal = Math.max(maxVal, v1, v2, v3, v4, v5, v6, v7);
+            if (maxVal < isoVal) continue;
+
+            let minVal = v0;
+            minVal = Math.min(minVal, v1, v2, v3, v4, v5, v6, v7);
+            if (minVal >= isoVal) continue;
+
+            const cubeVerts = [
+              [xi, yi, zi],
+              [xi + 1, yi, zi],
+              [xi + 1, yi + 1, zi],
+              [xi, yi + 1, zi],
+              [xi, yi, zi + 1],
+              [xi + 1, yi, zi + 1],
+              [xi + 1, yi + 1, zi + 1],
+              [xi, yi + 1, zi + 1]
+            ];
+            const cubeVals = [v0, v1, v2, v3, v4, v5, v6, v7];
+
+            for (let t = 0; t < 6; t++) {
+              const tet = TETRA_INDICES_6[t];
+              const tv0 = cubeVals[tet[0]];
+              const tv1 = cubeVals[tet[1]];
+              const tv2 = cubeVals[tet[2]];
+              const tv3 = cubeVals[tet[3]];
+
+              let mask = 0;
+              if (tv0 >= isoVal) mask |= 1;
+              if (tv1 >= isoVal) mask |= 2;
+              if (tv2 >= isoVal) mask |= 4;
+              if (tv3 >= isoVal) mask |= 8;
+
+              if (mask === 0 || mask === 15) continue;
+
+              const tetPos = [
+                cubeVerts[tet[0]],
+                cubeVerts[tet[1]],
+                cubeVerts[tet[2]],
+                cubeVerts[tet[3]]
+              ];
+              const tetVal = [tv0, tv1, tv2, tv3];
+
+              const edgeVerts = [];
+              for (let e = 0; e < 6; e++) {
+                const ea = TETRA_EDGES[e][0];
+                const eb = TETRA_EDGES[e][1];
+                edgeVerts.push(interpolatePos(
+                  tetPos[ea], tetPos[eb],
+                  tetVal[ea], tetVal[eb],
+                  isoVal
+                ));
+              }
+
+              const triangles = MT_CASE_TABLE[mask];
+              for (let tri = 0; tri < triangles.length; tri++) {
+                const triEdges = triangles[tri];
+                for (let vi = 0; vi < 3; vi++) {
+                  const ev = edgeVerts[triEdges[vi]];
+                  const px = (ev[0] / (Nx - 1)) * 2 - 1;
+                  const py = (ev[1] / (Ny - 1)) * 2 - 1;
+                  const pz = (ev[2] / (Nz - 1)) * 2 - 1;
+
+                  const vx = (ev[0] + 0.5) | 0;
+                  const vy = (ev[1] + 0.5) | 0;
+                  const vz = (ev[2] + 0.5) | 0;
+                  const n = computeNormal(vx, vy, vz);
+
+                  let intensity = (tetVal[0] + tetVal[1] + tetVal[2] + tetVal[3]) / 4 / 255;
+                  intensity = Math.min(1, Math.max(0, (intensity - isoNorm) / (1 - isoNorm) * 2));
+
+                  verticesArr.push(px, py, pz);
+                  normalsArr.push(n[0], n[1], n[2]);
+                  colorsArr.push(1.0, 0.15 + intensity * 0.3, 0.1 + intensity * 0.1, 0.95);
+                  indicesArr.push(vertexCount++);
+                }
+              }
+            }
+          }
+        }
+        const pct = 5 + Math.round(((zi - startZ + 1) / (endZ - startZ)) * 90 * (endZ - startZ) / Nz);
+        self.postMessage({ type: 'hailCoreProgress', payload: { percent: pct, message: `🧊 提取进度 ${Math.round(((zi + 1) / Nz) * 100)}%` } });
+      }
+    }
+
+    function processNextBatch() {
+      try {
+        if (z >= Nz - 1) {
+          self.postMessage({ type: 'hailCoreProgress', payload: { percent: 97, message: '🧊 构建网格数据...' } });
+
+          const vertices = new Float32Array(verticesArr);
+          const normals = new Float32Array(normalsArr);
+          const colors = new Float32Array(colorsArr);
+          const indices = new Uint32Array(indicesArr);
+
+          setTimeout(() => {
+            resolve({
+              vertices,
+              normals,
+              colors,
+              indices,
+              vertexCount: vertexCount,
+              triangleCount: Math.floor(vertexCount / 3),
+              threshold,
+              boundingBox: { min: [0, 0, 0], max: [Nx, Ny, Nz] }
+            });
+          }, 20);
+          return;
+        }
+
+        const end = Math.min(z + batchSize, Nz - 1);
+        processZSlice(z, end);
+        z = end;
+        setTimeout(processNextBatch, 0);
+      } catch (err) {
+        reject(err);
+      }
+    }
+
+    setTimeout(processNextBatch, 0);
   });
 }

@@ -23,6 +23,12 @@ export class VolumeRenderer {
     this.transferFuncCanvas = null;
     this.volumeMaterial = null;
     this.bboxMesh = null;
+
+    this.hailCoreMesh = null;
+    this.hailCoreMaterial = null;
+    this.hailCoreGeom = null;
+    this.hailCoreGlow = null;
+    this.hailCoreReady = false;
     this.dataReady = false;
     this.glInitialized = false;
     this.contextLost = false;
@@ -45,7 +51,14 @@ export class VolumeRenderer {
       sliceZ: 0.5,
       sliceOpacity: 0.8,
       sliceAnimate: false,
-      rotationSpeed: 0
+      rotationSpeed: 0,
+
+      showHailCore: true,
+      hailThreshold: 65,
+      hailPulseSpeed: 2.5,
+      hailPulseIntensity: 0.35,
+      hailOpacity: 1.0,
+      hailWireframe: false
     };
 
     this.stats = {
@@ -210,6 +223,105 @@ export class VolumeRenderer {
     this.scene.add(this.volumeMesh);
   }
 
+  _initHailCoreMesh() {
+    if (this.hailCoreMesh) return;
+
+    this.hailCoreGeom = new THREE.BufferGeometry();
+    const emptyPos = new Float32Array(0);
+    const emptyNorm = new Float32Array(0);
+    const emptyColor = new Float32Array(0);
+    const emptyIdx = new Uint32Array(0);
+
+    this.hailCoreGeom.setAttribute('position', new THREE.BufferAttribute(emptyPos, 3));
+    this.hailCoreGeom.setAttribute('normal', new THREE.BufferAttribute(emptyNorm, 3));
+    this.hailCoreGeom.setAttribute('color', new THREE.BufferAttribute(emptyColor, 4));
+    this.hailCoreGeom.setIndex(new THREE.BufferAttribute(emptyIdx, 1));
+
+    this.hailCoreMaterial = new THREE.MeshPhongMaterial({
+      color: 0xff3030,
+      emissive: 0xff1010,
+      emissiveIntensity: 0.8,
+      shininess: 100,
+      transparent: true,
+      opacity: 0.95,
+      side: THREE.DoubleSide,
+      vertexColors: true,
+      wireframe: false
+    });
+
+    this.hailCoreMesh = new THREE.Mesh(this.hailCoreGeom, this.hailCoreMaterial);
+    this.hailCoreMesh.visible = this.params.showHailCore;
+    this.scene.add(this.hailCoreMesh);
+
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: 0xff2020,
+      transparent: true,
+      opacity: 0.15,
+      side: THREE.BackSide,
+      depthWrite: false
+    });
+    const glowGeom = new THREE.BoxGeometry(2.08, 2.08, 2.08);
+    this.hailCoreGlow = new THREE.Mesh(glowGeom, glowMat);
+    this.hailCoreGlow.visible = false;
+    this.scene.add(this.hailCoreGlow);
+  }
+
+  setHailCoreGeometry(meshData) {
+    this._initHailCoreMesh();
+
+    if (!meshData || meshData.vertexCount === 0) {
+      this.hailCoreMesh.visible = false;
+      this.hailCoreGlow.visible = false;
+      this.hailCoreReady = false;
+      return;
+    }
+
+    const posAttr = this.hailCoreGeom.getAttribute('position');
+    if (posAttr.count !== meshData.vertices.length / 3) {
+      this.hailCoreGeom.setAttribute('position', new THREE.BufferAttribute(meshData.vertices, 3));
+      this.hailCoreGeom.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+      this.hailCoreGeom.setAttribute('color', new THREE.BufferAttribute(meshData.colors, 4));
+      this.hailCoreGeom.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+    } else {
+      posAttr.array.set(meshData.vertices);
+      posAttr.needsUpdate = true;
+      const normAttr = this.hailCoreGeom.getAttribute('normal');
+      normAttr.array.set(meshData.normals);
+      normAttr.needsUpdate = true;
+      const colAttr = this.hailCoreGeom.getAttribute('color');
+      colAttr.array.set(meshData.colors);
+      colAttr.needsUpdate = true;
+      const idxAttr = this.hailCoreGeom.getIndex();
+      idxAttr.array.set(meshData.indices);
+      idxAttr.needsUpdate = true;
+    }
+
+    this.hailCoreGeom.computeBoundingBox();
+    this.hailCoreGeom.computeBoundingSphere();
+
+    this.hailCoreMesh.visible = this.params.showHailCore;
+    this.hailCoreGlow.visible = this.params.showHailCore && meshData.vertexCount > 0;
+    this.hailCoreReady = true;
+  }
+
+  _updateHailCorePulse(time) {
+    if (!this.hailCoreReady || !this.params.showHailCore) return;
+
+    const pulse = 0.5 + 0.5 * Math.sin(time * this.params.hailPulseSpeed);
+    const intensity = 0.6 + pulse * this.params.hailPulseIntensity;
+
+    if (this.hailCoreMaterial) {
+      this.hailCoreMaterial.emissiveIntensity = intensity;
+      this.hailCoreMaterial.opacity = this.params.hailOpacity * (0.85 + pulse * 0.15);
+    }
+
+    if (this.hailCoreGlow && this.hailCoreGlow.material) {
+      this.hailCoreGlow.material.opacity = 0.1 + pulse * 0.2;
+      const glowScale = 1 + pulse * 0.04;
+      this.hailCoreGlow.scale.set(glowScale, glowScale, glowScale);
+    }
+  }
+
   setVolumeData(data, size, range, stats) {
     this.initPersistentResources();
 
@@ -330,6 +442,13 @@ export class VolumeRenderer {
     this.params[key] = value;
     if (key === 'colormap' || key === 'thresholdMin' || key === 'thresholdMax') {
       this.updateTransferFunction();
+    } else if (key === 'showHailCore') {
+      if (this.hailCoreMesh) this.hailCoreMesh.visible = value;
+      if (this.hailCoreGlow) this.hailCoreGlow.visible = value && this.hailCoreReady;
+    } else if (key === 'hailWireframe') {
+      if (this.hailCoreMaterial) this.hailCoreMaterial.wireframe = value;
+    } else if (key === 'hailOpacity') {
+      if (this.hailCoreMaterial) this.hailCoreMaterial.opacity = value;
     } else {
       this.updateUniforms();
     }
@@ -442,8 +561,12 @@ export class VolumeRenderer {
         this.volumeMesh.rotation.y += dt * this.params.rotationSpeed;
         if (this.bboxMesh) this.bboxMesh.rotation.y += dt * this.params.rotationSpeed;
         if (this.bboxLine) this.bboxLine.rotation.y += dt * this.params.rotationSpeed;
+        if (this.hailCoreMesh) this.hailCoreMesh.rotation.y += dt * this.params.rotationSpeed;
+        if (this.hailCoreGlow) this.hailCoreGlow.rotation.y += dt * this.params.rotationSpeed;
       }
     }
+
+    this._updateHailCorePulse(this.clock.elapsedTime);
 
     this.renderer.render(this.scene, this.camera);
     this.frameCount++;

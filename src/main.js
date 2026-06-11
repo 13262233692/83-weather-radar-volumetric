@@ -43,6 +43,12 @@ class RadarVolumetricApp {
         this.updateLoader(payload.percent, payload.message);
       } else if (type === 'processComplete') {
         this.onVolumeProcessed(payload);
+      } else if (type === 'hailCoreProgress') {
+        this.updateLoader(payload.percent, payload.message);
+      } else if (type === 'hailCoreComplete') {
+        this.onHailCoreProcessed(payload);
+      } else if (type === 'hailCoreError') {
+        console.warn('冰雹核心提取失败:', error);
       } else if (type === 'processError' || type === 'parseError') {
         this.hideLoader();
         alert('处理失败: ' + error);
@@ -115,6 +121,31 @@ class RadarVolumetricApp {
       else this.stopLiveUpdate();
     });
 
+    const hailFolder = this.gui.addFolder('🧊 冰雹核心提取');
+    hailFolder.add(this.renderer.params, 'showHailCore').name('显示冰雹核心')
+      .onChange(v => this.renderer.setParam('showHailCore', v));
+    hailFolder.add(this.renderer.params, 'hailThreshold', 40, 75, 1)
+      .name('dBZ 阈值').onChange(v => {
+        this.renderer.params.hailThreshold = v;
+        this._scheduleHailReextract();
+      });
+    hailFolder.add(this.renderer.params, 'hailPulseSpeed', 0, 8, 0.1)
+      .name('脉动速度').onChange(v => this.renderer.setParam('hailPulseSpeed', v));
+    hailFolder.add(this.renderer.params, 'hailPulseIntensity', 0, 1, 0.01)
+      .name('脉动强度').onChange(v => this.renderer.setParam('hailPulseIntensity', v));
+    hailFolder.add(this.renderer.params, 'hailOpacity', 0, 1, 0.01)
+      .name('不透明度').onChange(v => this.renderer.setParam('hailOpacity', v));
+    hailFolder.add(this.renderer.params, 'hailWireframe').name('线框模式')
+      .onChange(v => this.renderer.setParam('hailWireframe', v));
+    hailFolder.add({ '重新提取': () => this.extractHailCore() }, '重新提取');
+    this.hailStatEl = document.createElement('div');
+    this.hailStatEl.style.cssText = 'font-size:10px; color:#888; margin-top:6px; font-family:Consolas,monospace;';
+    this.hailStatEl.textContent = '冰雹核心: 等待提取...';
+    hailFolder.domElement.appendChild(this.hailStatEl);
+    hailFolder.open();
+
+    this._hailReextractTimer = null;
+
     this.createColorBar();
   }
 
@@ -157,6 +188,43 @@ class RadarVolumetricApp {
         gridHeight: 96
       }
     }, [polar.reflectivity.buffer]);
+  }
+
+  _scheduleHailReextract() {
+    if (this._hailReextractTimer) clearTimeout(this._hailReextractTimer);
+    this._hailReextractTimer = setTimeout(() => {
+      this.extractHailCore();
+    }, 250);
+  }
+
+  extractHailCore() {
+    if (!this.currentVolumeData) {
+      console.warn('暂无体数据，无法提取冰雹核心');
+      return;
+    }
+
+    const dataCopy = new Uint8Array(this.currentVolumeData.data);
+    this.worker.postMessage({
+      type: 'extractHailCore',
+      payload: {
+        volumeData: dataCopy,
+        size: this.currentVolumeData.size,
+        range: this.currentVolumeData.range,
+        threshold: this.renderer.params.hailThreshold,
+        zdrThreshold: 0.5
+      }
+    }, [dataCopy.buffer]);
+  }
+
+  onHailCoreProcessed(meshData) {
+    this.renderer.setHailCoreGeometry(meshData);
+    if (this.hailStatEl) {
+      if (meshData.vertexCount > 0) {
+        this.hailStatEl.innerHTML = `✅ 冰雹核心: ${meshData.triangleCount.toLocaleString()} 三角面 / ${meshData.vertexCount.toLocaleString()} 顶点`;
+      } else {
+        this.hailStatEl.innerHTML = '⚠ 未检测到冰雹核心 (阈值过高或无强对流区)';
+      }
+    }
   }
 
   createColorBar() {
@@ -276,6 +344,13 @@ class RadarVolumetricApp {
   }
 
   onVolumeProcessed(result) {
+    this.currentVolumeData = {
+      data: result.data,
+      size: result.size,
+      range: result.range,
+      stats: result.stats
+    };
+
     if (this.firstLoad) {
       this.renderer.setVolumeData(result.data, result.size, result.range, result.stats);
       this.firstLoad = false;
@@ -285,6 +360,10 @@ class RadarVolumetricApp {
 
     this.updateInfoPanel(result);
     this.updateColorBar();
+
+    if (this.renderer.params.showHailCore) {
+      this.extractHailCore();
+    }
 
     if (this.liveUpdateCount > 0) {
       const memInfo = this.getMemoryInfo();
