@@ -9,6 +9,10 @@ import {
 } from '../shaders/VolumeShader.js';
 import { createTransferFunctionCanvas, applyThresholdToCanvas } from '../utils/TransferFunction.js';
 
+const MAX_TEX_WIDTH = 256;
+const MAX_TEX_HEIGHT = 256;
+const MAX_TEX_DEPTH = 128;
+
 export class VolumeRenderer {
   constructor(container) {
     this.container = container;
@@ -16,9 +20,16 @@ export class VolumeRenderer {
     this.volumeMesh = null;
     this.volumeTexture = null;
     this.transferFuncTexture = null;
+    this.transferFuncCanvas = null;
     this.volumeMaterial = null;
     this.bboxMesh = null;
     this.dataReady = false;
+    this.glInitialized = false;
+    this.contextLost = false;
+    this.pendingData = null;
+    this.frameCount = 0;
+
+    this.activeSize = { x: 0, y: 0, z: 0 };
 
     this.params = {
       stepSize: 0.003,
@@ -76,12 +87,252 @@ export class VolumeRenderer {
     this.controls.maxDistance = 12;
     this.controls.target.set(0, 0.3, 0);
 
+    this.renderer.domElement.addEventListener('webglcontextlost', this.onContextLost.bind(this));
+    this.renderer.domElement.addEventListener('webglcontextrestored', this.onContextRestored.bind(this));
+
     this.addAxesGrid();
     this.addLightingRig();
     this.createBBox();
+    this.initPersistentResources();
 
     window.addEventListener('resize', this.onResize.bind(this));
     this.animate();
+  }
+
+  onContextLost(event) {
+    event.preventDefault();
+    this.contextLost = true;
+    this.glInitialized = false;
+    console.error('[VolumeRenderer] WebGL Context Lost! 显存溢出或GPU异常。等待恢复...');
+  }
+
+  onContextRestored() {
+    this.contextLost = false;
+    console.log('[VolumeRenderer] WebGL Context 已恢复，重新初始化资源...');
+    this.initPersistentResources();
+    if (this.pendingData) {
+      const pd = this.pendingData;
+      this.pendingData = null;
+      this.updateVolumeData(pd.data, pd.size, pd.range, pd.stats);
+    }
+  }
+
+  initPersistentResources() {
+    if (this.glInitialized) return;
+
+    this._createPersistentVolumeTexture();
+    this._createPersistentTransferFunc();
+    this._createPersistentMaterial();
+    this._createPersistentMesh();
+
+    this.glInitialized = true;
+  }
+
+  _createPersistentVolumeTexture() {
+    if (this.volumeTexture) return;
+
+    const data = new Uint8Array(MAX_TEX_WIDTH * MAX_TEX_HEIGHT * MAX_TEX_DEPTH);
+
+    this.volumeTexture = new Data3DTexture(
+      data,
+      MAX_TEX_WIDTH,
+      MAX_TEX_HEIGHT,
+      MAX_TEX_DEPTH
+    );
+    this.volumeTexture.format = THREE.RedFormat;
+    this.volumeTexture.type = THREE.UnsignedByteType;
+    this.volumeTexture.minFilter = THREE.LinearFilter;
+    this.volumeTexture.magFilter = THREE.LinearFilter;
+    this.volumeTexture.unpackAlignment = 1;
+    this.volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
+    this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
+
+    this._forceUploadTexture();
+  }
+
+  _forceUploadTexture() {
+    if (!this.volumeTexture) return;
+    this.volumeTexture.needsUpdate = true;
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  _createPersistentTransferFunc() {
+    if (this.transferFuncTexture) return;
+
+    this.transferFuncCanvas = document.createElement('canvas');
+    this.transferFuncCanvas.width = 256;
+    this.transferFuncCanvas.height = 1;
+
+    this.transferFuncTexture = new THREE.CanvasTexture(this.transferFuncCanvas);
+    this.transferFuncTexture.minFilter = THREE.LinearFilter;
+    this.transferFuncTexture.magFilter = THREE.LinearFilter;
+    this.transferFuncTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.transferFuncTexture.wrapT = THREE.ClampToEdgeWrapping;
+  }
+
+  _createPersistentMaterial() {
+    if (this.volumeMaterial) return;
+
+    this.volumeMaterial = new THREE.ShaderMaterial({
+      vertexShader: VolumeVertexShader,
+      fragmentShader: VolumeFragmentShader,
+      uniforms: {
+        u_volume: { value: this.volumeTexture },
+        u_transferFunc: { value: this.transferFuncTexture },
+        u_cameraPos: { value: new THREE.Vector3() },
+        u_threshold: { value: 0.1 },
+        u_maxdBZ: { value: 80 },
+        u_mindBZ: { value: -32 },
+        u_stepSize: { value: this.params.stepSize },
+        u_density: { value: this.params.density },
+        u_brightness: { value: this.params.brightness },
+        u_renderMode: { value: this.params.renderMode },
+        u_boundsMin: { value: new THREE.Vector3(0, 0, 0) },
+        u_boundsMax: { value: new THREE.Vector3(1, 1, 1) },
+        u_showSlice: { value: this.params.showSlice },
+        u_sliceZ: { value: this.params.sliceZ },
+        u_sliceOpacity: { value: this.params.sliceOpacity },
+        u_activeSize: { value: new THREE.Vector3(1.0, 1.0, 1.0) }
+      },
+      side: THREE.BackSide,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending
+    });
+  }
+
+  _createPersistentMesh() {
+    if (this.volumeMesh) return;
+
+    const volGeom = new THREE.BoxGeometry(2, 2, 2);
+    this.volumeMesh = new THREE.Mesh(volGeom, this.volumeMaterial);
+    this.scene.add(this.volumeMesh);
+  }
+
+  setVolumeData(data, size, range, stats) {
+    this.initPersistentResources();
+
+    this.activeSize = { x: size.x, y: size.y, z: size.z };
+    this.stats.resolution = size;
+    this.stats.range = range;
+    this.stats.voxelCount = stats?.voxelCount || size.x * size.y * size.z;
+    this.stats.nonZero = stats?.nonZero || 0;
+
+    if (this.volumeMaterial) {
+      this.volumeMaterial.uniforms.u_maxdBZ.value = range.max;
+      this.volumeMaterial.uniforms.u_mindBZ.value = range.min;
+      this.volumeMaterial.uniforms.u_activeSize.value.set(
+        size.x / MAX_TEX_WIDTH,
+        size.y / MAX_TEX_HEIGHT,
+        size.z / MAX_TEX_DEPTH
+      );
+    }
+
+    this._uploadVolumeDataInPlace(data, size);
+    this.updateTransferFunction();
+    this.dataReady = true;
+  }
+
+  updateVolumeData(data, size, range, stats) {
+    if (this.contextLost) {
+      this.pendingData = { data, size, range, stats };
+      return;
+    }
+
+    this.activeSize = { x: size.x, y: size.y, z: size.z };
+    this.stats.resolution = size;
+    if (range) {
+      this.stats.range = range;
+      if (this.volumeMaterial) {
+        this.volumeMaterial.uniforms.u_maxdBZ.value = range.max;
+        this.volumeMaterial.uniforms.u_mindBZ.value = range.min;
+      }
+    }
+    if (stats) {
+      this.stats.voxelCount = stats.voxelCount || size.x * size.y * size.z;
+      this.stats.nonZero = stats.nonZero || 0;
+    }
+
+    if (this.volumeMaterial) {
+      this.volumeMaterial.uniforms.u_activeSize.value.set(
+        size.x / MAX_TEX_WIDTH,
+        size.y / MAX_TEX_HEIGHT,
+        size.z / MAX_TEX_DEPTH
+      );
+    }
+
+    this._uploadVolumeDataInPlace(data, size);
+    this.dataReady = true;
+  }
+
+  _uploadVolumeDataInPlace(data, size) {
+    if (!this.volumeTexture) return;
+
+    const gl = this.renderer.getContext();
+    const textureProps = this.renderer.properties.get(this.volumeTexture);
+
+    if (!textureProps || !textureProps.__webglTexture) {
+      this.volumeTexture.image.data.set(data);
+      this.volumeTexture.needsUpdate = true;
+      return;
+    }
+
+    gl.bindTexture(gl.TEXTURE_3D, textureProps.__webglTexture);
+    gl.texSubImage3D(
+      gl.TEXTURE_3D,
+      0,
+      0, 0, 0,
+      size.x, size.y, size.z,
+      gl.RED,
+      gl.UNSIGNED_BYTE,
+      data
+    );
+    gl.bindTexture(gl.TEXTURE_3D, null);
+  }
+
+  updateTransferFunction() {
+    if (!this.transferFuncCanvas) return;
+
+    const canvas = createTransferFunctionCanvas(
+      this.stats.range.min,
+      this.stats.range.max,
+      this.params.colormap
+    );
+    applyThresholdToCanvas(
+      canvas,
+      this.params.thresholdMin,
+      this.params.thresholdMax,
+      this.stats.range.min,
+      this.stats.range.max
+    );
+
+    const ctx = this.transferFuncCanvas.getContext('2d');
+    ctx.clearRect(0, 0, this.transferFuncCanvas.width, this.transferFuncCanvas.height);
+    ctx.drawImage(canvas, 0, 0);
+
+    this.transferFuncTexture.needsUpdate = true;
+  }
+
+  updateUniforms() {
+    if (!this.volumeMaterial) return;
+    const u = this.volumeMaterial.uniforms;
+    u.u_stepSize.value = this.params.stepSize;
+    u.u_density.value = this.params.density;
+    u.u_brightness.value = this.params.brightness;
+    u.u_renderMode.value = this.params.renderMode;
+    u.u_showSlice.value = this.params.showSlice;
+    u.u_sliceZ.value = this.params.sliceZ;
+    u.u_sliceOpacity.value = this.params.sliceOpacity;
+  }
+
+  setParam(key, value) {
+    this.params[key] = value;
+    if (key === 'colormap' || key === 'thresholdMin' || key === 'thresholdMax') {
+      this.updateTransferFunction();
+    } else {
+      this.updateUniforms();
+    }
   }
 
   addAxesGrid() {
@@ -159,136 +410,6 @@ export class VolumeRenderer {
     this.scene.add(this.bboxMesh);
   }
 
-  setVolumeData(data, size, range, stats) {
-    this.disposeVolume();
-
-    this.stats.resolution = size;
-    this.stats.range = range;
-    this.stats.voxelCount = stats?.voxelCount || size.x * size.y * size.z;
-    this.stats.nonZero = stats?.nonZero || 0;
-
-    this.volumeTexture = new Data3DTexture(
-      data,
-      size.x,
-      size.y,
-      size.z
-    );
-    this.volumeTexture.format = THREE.RedFormat;
-    this.volumeTexture.type = THREE.UnsignedByteType;
-    this.volumeTexture.minFilter = THREE.LinearFilter;
-    this.volumeTexture.magFilter = THREE.LinearFilter;
-    this.volumeTexture.unpackAlignment = 1;
-    this.volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.needsUpdate = true;
-
-    this.updateTransferFunction();
-
-    const volGeom = new THREE.BoxGeometry(2, 2, 2);
-
-    this.volumeMaterial = new THREE.ShaderMaterial({
-      vertexShader: VolumeVertexShader,
-      fragmentShader: VolumeFragmentShader,
-      uniforms: {
-        u_volume: { value: this.volumeTexture },
-        u_transferFunc: { value: this.transferFuncTexture },
-        u_cameraPos: { value: new THREE.Vector3() },
-        u_threshold: { value: 0.1 },
-        u_maxdBZ: { value: range.max },
-        u_mindBZ: { value: range.min },
-        u_stepSize: { value: this.params.stepSize },
-        u_density: { value: this.params.density },
-        u_brightness: { value: this.params.brightness },
-        u_renderMode: { value: this.params.renderMode },
-        u_boundsMin: { value: new THREE.Vector3(0, 0, 0) },
-        u_boundsMax: { value: new THREE.Vector3(1, 1, 1) },
-        u_showSlice: { value: this.params.showSlice },
-        u_sliceZ: { value: this.params.sliceZ },
-        u_sliceOpacity: { value: this.params.sliceOpacity }
-      },
-      side: THREE.BackSide,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.NormalBlending
-    });
-
-    this.volumeMesh = new THREE.Mesh(volGeom, this.volumeMaterial);
-    this.scene.add(this.volumeMesh);
-
-    this.dataReady = true;
-  }
-
-  updateTransferFunction() {
-    const canvas = createTransferFunctionCanvas(
-      this.stats.range.min,
-      this.stats.range.max,
-      this.params.colormap
-    );
-    applyThresholdToCanvas(
-      canvas,
-      this.params.thresholdMin,
-      this.params.thresholdMax,
-      this.stats.range.min,
-      this.stats.range.max
-    );
-
-    if (this.transferFuncTexture) {
-      this.transferFuncTexture.dispose();
-    }
-
-    this.transferFuncTexture = new THREE.CanvasTexture(canvas);
-    this.transferFuncTexture.minFilter = THREE.LinearFilter;
-    this.transferFuncTexture.magFilter = THREE.LinearFilter;
-    this.transferFuncTexture.wrapS = THREE.ClampToEdgeWrapping;
-    this.transferFuncTexture.wrapT = THREE.ClampToEdgeWrapping;
-    this.transferFuncTexture.needsUpdate = true;
-
-    if (this.volumeMaterial) {
-      this.volumeMaterial.uniforms.u_transferFunc.value = this.transferFuncTexture;
-    }
-  }
-
-  updateUniforms() {
-    if (!this.volumeMaterial) return;
-    const u = this.volumeMaterial.uniforms;
-    u.u_stepSize.value = this.params.stepSize;
-    u.u_density.value = this.params.density;
-    u.u_brightness.value = this.params.brightness;
-    u.u_renderMode.value = this.params.renderMode;
-    u.u_showSlice.value = this.params.showSlice;
-    u.u_sliceZ.value = this.params.sliceZ;
-    u.u_sliceOpacity.value = this.params.sliceOpacity;
-  }
-
-  setParam(key, value) {
-    this.params[key] = value;
-    if (key === 'colormap' || key === 'thresholdMin' || key === 'thresholdMax') {
-      this.updateTransferFunction();
-    } else {
-      this.updateUniforms();
-    }
-  }
-
-  disposeVolume() {
-    if (this.volumeMesh) {
-      this.scene.remove(this.volumeMesh);
-      this.volumeMesh.geometry.dispose();
-      this.volumeMesh.material.dispose();
-      this.volumeMesh = null;
-    }
-    if (this.volumeTexture) {
-      this.volumeTexture.dispose();
-      this.volumeTexture = null;
-    }
-    if (this.transferFuncTexture) {
-      this.transferFuncTexture.dispose();
-      this.transferFuncTexture = null;
-    }
-    this.volumeMaterial = null;
-    this.dataReady = false;
-  }
-
   onResize() {
     const { clientWidth, clientHeight } = this.container;
     this.width = clientWidth;
@@ -300,10 +421,13 @@ export class VolumeRenderer {
 
   animate() {
     requestAnimationFrame(this.animate.bind(this));
+
+    if (this.contextLost) return;
+
     const dt = this.clock.getDelta();
     this.controls.update();
 
-    if (this.volumeMesh && this.volumeMaterial) {
+    if (this.volumeMesh && this.volumeMaterial && this.dataReady) {
       const worldCam = new THREE.Vector3();
       this.camera.getWorldPosition(worldCam);
       const localCam = this.volumeMesh.worldToLocal(worldCam.clone()).multiplyScalar(0.5).addScalar(0.5);
@@ -322,12 +446,31 @@ export class VolumeRenderer {
     }
 
     this.renderer.render(this.scene, this.camera);
+    this.frameCount++;
   }
 
   dispose() {
-    this.disposeVolume();
+    if (this.volumeMesh) {
+      this.scene.remove(this.volumeMesh);
+      this.volumeMesh.geometry.dispose();
+      this.volumeMesh = null;
+    }
+    if (this.volumeMaterial) {
+      this.volumeMaterial.dispose();
+      this.volumeMaterial = null;
+    }
+    if (this.volumeTexture) {
+      this.volumeTexture.dispose();
+      this.volumeTexture = null;
+    }
+    if (this.transferFuncTexture) {
+      this.transferFuncTexture.dispose();
+      this.transferFuncTexture = null;
+    }
+    this.transferFuncCanvas = null;
     this.renderer.dispose();
     this.controls.dispose();
+    this.glInitialized = false;
     if (this.renderer.domElement.parentNode) {
       this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
     }

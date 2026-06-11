@@ -5,6 +5,8 @@ import { createTransferFunctionCanvas } from './utils/TransferFunction.js';
 import VolumeProcessor from './workers/VolumeProcessor.worker.js?worker';
 import GUI from 'lil-gui';
 
+const SIMULATED_UPDATE_INTERVAL = 15000;
+
 class RadarVolumetricApp {
   constructor() {
     this.container = document.getElementById('canvas-container');
@@ -18,6 +20,9 @@ class RadarVolumetricApp {
     this.currentData = null;
     this.worker = null;
     this.gui = null;
+    this.liveUpdateTimer = null;
+    this.liveUpdateCount = 0;
+    this.firstLoad = true;
 
     this.init();
   }
@@ -104,7 +109,54 @@ class RadarVolumetricApp {
       }
     }, '重置视角');
 
+    this.liveUpdateObj = { enabled: false };
+    dataFolder.add(this.liveUpdateObj, 'enabled').name('🔄 模拟实时更新').onChange(v => {
+      if (v) this.startLiveUpdate();
+      else this.stopLiveUpdate();
+    });
+
     this.createColorBar();
+  }
+
+  startLiveUpdate() {
+    this.stopLiveUpdate();
+    this.liveUpdateCount = 0;
+    this.liveUpdateTimer = setInterval(() => {
+      this.liveUpdateCount++;
+      this.updateLoader(5, `⏱ 实时更新 #${this.liveUpdateCount} (模拟 ${SIMULATED_UPDATE_INTERVAL/1000}s 间隔)...`);
+      this.showLoader();
+      this.generateAndProcessData();
+    }, SIMULATED_UPDATE_INTERVAL);
+    console.log('[LiveUpdate] 已启动模拟实时雷达流，间隔', SIMULATED_UPDATE_INTERVAL / 1000, '秒');
+  }
+
+  stopLiveUpdate() {
+    if (this.liveUpdateTimer) {
+      clearInterval(this.liveUpdateTimer);
+      this.liveUpdateTimer = null;
+      console.log('[LiveUpdate] 已停止，共更新', this.liveUpdateCount, '帧');
+    }
+  }
+
+  generateAndProcessData() {
+    const polar = generateMockPolarVolume({
+      numElevations: 14,
+      numAzimuths: 360,
+      numRanges: 500,
+      maxRange: 200
+    });
+
+    this.currentData = polar;
+
+    this.worker.postMessage({
+      type: 'processPolar',
+      payload: {
+        ...polar,
+        reflectivity: polar.reflectivity,
+        gridSize: 160,
+        gridHeight: 96
+      }
+    }, [polar.reflectivity.buffer]);
   }
 
   createColorBar() {
@@ -136,7 +188,7 @@ class RadarVolumetricApp {
     this.colorBar = { canvas, labels };
     this.updateColorBar();
 
-    setInterval(() => this.updateColorBar(), 500);
+    setInterval(() => this.updateColorBar(), 2000);
   }
 
   updateColorBar() {
@@ -219,34 +271,40 @@ class RadarVolumetricApp {
 
     await new Promise(r => setTimeout(r, 100));
 
-    const polar = generateMockPolarVolume({
-      numElevations: 14,
-      numAzimuths: 360,
-      numRanges: 500,
-      maxRange: 200
-    });
-
-    this.currentData = polar;
-
-    this.updateLoader(10, '极坐标→笛卡尔坐标重采样插值中...');
-    this.worker.postMessage({
-      type: 'processPolar',
-      payload: {
-        ...polar,
-        reflectivity: polar.reflectivity,
-        gridSize: 160,
-        gridHeight: 96
-      }
-    }, [polar.reflectivity.buffer]);
+    this.firstLoad = true;
+    this.generateAndProcessData();
   }
 
   onVolumeProcessed(result) {
-    this.renderer.setVolumeData(result.data, result.size, result.range, result.stats);
+    if (this.firstLoad) {
+      this.renderer.setVolumeData(result.data, result.size, result.range, result.stats);
+      this.firstLoad = false;
+    } else {
+      this.renderer.updateVolumeData(result.data, result.size, result.range, result.stats);
+    }
 
     this.updateInfoPanel(result);
     this.updateColorBar();
 
-    setTimeout(() => this.hideLoader(), 400);
+    if (this.liveUpdateCount > 0) {
+      const memInfo = this.getMemoryInfo();
+      const memStr = memInfo ? ` | JS堆: ${(memInfo.usedJSHeapSize / 1048576).toFixed(1)}MB` : '';
+      this.loaderText.textContent = `✅ 实时更新 #${this.liveUpdateCount} 完成${memStr}`;
+      setTimeout(() => this.hideLoader(), 2000);
+    } else {
+      setTimeout(() => this.hideLoader(), 400);
+    }
+  }
+
+  getMemoryInfo() {
+    if (performance.memory) {
+      return {
+        usedJSHeapSize: performance.memory.usedJSHeapSize,
+        totalJSHeapSize: performance.memory.totalJSHeapSize,
+        jsHeapSizeLimit: performance.memory.jsHeapSizeLimit
+      };
+    }
+    return null;
   }
 
   updateInfoPanel(result) {

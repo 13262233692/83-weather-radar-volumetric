@@ -33,6 +33,7 @@ export const VolumeFragmentShader = /* glsl */`
   uniform bool u_showSlice;
   uniform float u_sliceZ;
   uniform float u_sliceOpacity;
+  uniform vec3 u_activeSize;
 
   bool intersectBox(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float tNear, out float tFar) {
     vec3 invR = 1.0 / rd;
@@ -45,8 +46,13 @@ export const VolumeFragmentShader = /* glsl */`
     return tNear < tFar;
   }
 
-  vec4 sampleVolume(vec3 pos) {
-    float scalar = texture(u_volume, pos).r;
+  float sampleScalar(vec3 localPos) {
+    vec3 texCoord = localPos * u_activeSize;
+    return texture(u_volume, texCoord).r;
+  }
+
+  vec4 sampleVolume(vec3 localPos) {
+    float scalar = sampleScalar(localPos);
     vec4 tf = texture2D(u_transferFunc, vec2(scalar, 0.5));
     return tf;
   }
@@ -67,6 +73,7 @@ export const VolumeFragmentShader = /* glsl */`
     int maxSteps = 512;
     int stepCount = int(dist / u_stepSize);
     stepCount = min(stepCount, maxSteps);
+    if (stepCount < 1) stepCount = 1;
     float actualStep = dist / float(stepCount);
 
     vec4 accumulatedColor = vec4(0.0);
@@ -115,17 +122,17 @@ export const VolumeFragmentShader = /* glsl */`
     }
 
     if (u_renderMode == 2 && maxVal > 0.001) {
-      float eps = 0.01;
+      float eps = 0.005;
       vec3 grad;
-      grad.x = texture(u_volume, maxPos + vec3(eps, 0.0, 0.0)).r - texture(u_volume, maxPos - vec3(eps, 0.0, 0.0)).r;
-      grad.y = texture(u_volume, maxPos + vec3(0.0, eps, 0.0)).r - texture(u_volume, maxPos - vec3(0.0, eps, 0.0)).r;
-      grad.z = texture(u_volume, maxPos + vec3(0.0, 0.0, eps)).r - texture(u_volume, maxPos - vec3(0.0, 0.0, eps)).r;
+      grad.x = sampleScalar(maxPos + vec3(eps, 0.0, 0.0)) - sampleScalar(maxPos - vec3(eps, 0.0, 0.0));
+      grad.y = sampleScalar(maxPos + vec3(0.0, eps, 0.0)) - sampleScalar(maxPos - vec3(0.0, eps, 0.0));
+      grad.z = sampleScalar(maxPos + vec3(0.0, 0.0, eps)) - sampleScalar(maxPos - vec3(0.0, 0.0, eps));
       float gradLen = length(grad);
       if (gradLen > 0.0001) grad /= gradLen;
       vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
       float diffuse = max(dot(grad, lightDir), 0.0);
       float ambient = 0.3;
-      vec4 baseColor = texture2D(u_transferFunc, vec2(texture(u_volume, maxPos).r, 0.5));
+      vec4 baseColor = texture2D(u_transferFunc, vec2(sampleScalar(maxPos), 0.5));
       accumulatedColor.rgb = baseColor.rgb * (ambient + diffuse * 0.7);
       accumulatedColor.a = baseColor.a;
     }
